@@ -6,8 +6,10 @@ from jose import JWTError, jwt
 from litestar import Litestar, Request, get, post
 from litestar.exceptions import HTTPException
 from litestar.response import Response
-from litestar.status_codes import HTTP_401_UNAUTHORIZED, HTTP_403_FORBIDDEN
+from litestar.status_codes import HTTP_401_UNAUTHORIZED, HTTP_403_FORBIDDEN, HTTP_404_NOT_FOUND
 from passlib.context import CryptContext
+from psycopg.types.json import Jsonb
+from psycopg import IsolationLevel
 
 from db import SCHEMA, connect
 from rules import judge
@@ -75,10 +77,10 @@ def need_login(request: Request):
     return user
 
 
-def need_writer(request: Request):
+def need_writer(request: Request, detail: str = "仅扫描员可执行此操作"):
     user = need_login(request)
     if user["role"] != "writer":
-        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="仅扫描员可提交IV扫描")
+        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail=detail)
     return user
 
 
@@ -141,4 +143,119 @@ async def create_log(request: Request) -> dict:
         return dump(row)
 
 
-app = Litestar(route_handlers=[health, login, list_logs, create_log])
+def render_book_body(stamped_at, stamped_by, counts, scans):
+    lines = [
+        "交班本",
+        f"盖章时间：{stamped_at:%Y-%m-%d %H:%M:%S} UTC",
+        f"交班人：{stamped_by}",
+        "",
+        "盖章瞬间三张计数：",
+        f"  在线单据总数：{counts['total']}",
+        f"  合格：{counts['pass']}",
+        f"  衰减：{counts['decay']}",
+        "",
+        "盖章瞬间在线单据明细：",
+    ]
+    if not scans:
+        lines.append("  （一张单据都没有）")
+    else:
+        for r in scans:
+            verdict = r["verdict"] or "—"
+            lines.append(
+                f"  #{r['id']} {r['string_code']} Voc={r['voc_v']} Isc={r['isc_a']} "
+                f"FF={r['fill_factor']} 状态={r['status']} 结论={verdict}"
+            )
+    return "\n".join(lines)
+
+
+@get("/api/handover-books")
+async def list_handover_books(request: Request) -> list:
+    need_login(request)
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT id, stamped_at, stamped_by, total_count, pass_count,
+                      decay_count, pending_count
+               FROM shift_handover_books ORDER BY id DESC"""
+        ).fetchall()
+        return [dump(r) for r in rows]
+
+
+@get("/api/handover-books/{book_id:int}")
+async def get_handover_book(book_id: int, request: Request) -> dict:
+    need_login(request)
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT id, stamped_at, stamped_by, total_count, pass_count,
+                      decay_count, pending_count, body, snapshot
+               FROM shift_handover_books WHERE id = %s""",
+            (book_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="这本交班本不存在")
+        return dump(row)
+
+
+@post("/api/handover-books", status_code=201)
+async def stamp_handover_book(request: Request) -> dict:
+    user = need_writer(request, detail="仅扫描员可盖交班章，观察员只能翻看已盖的本")
+    stamped_at = datetime.now(timezone.utc)
+    with connect() as conn:
+        # REPEATABLE READ：计数与明细共用同一快照，全部取自按下盖章这一瞬
+        conn.isolation_level = IsolationLevel.REPEATABLE_READ
+        with conn.transaction():
+            counts_row = conn.execute(
+                """SELECT
+                     COUNT(*) AS total,
+                     COUNT(*) FILTER (WHERE verdict = '合格') AS pass,
+                     COUNT(*) FILTER (WHERE verdict = '衰减') AS decay,
+                     COUNT(*) FILTER (WHERE status = 'pending') AS pending
+                   FROM iv_scans"""
+            ).fetchone()
+            scans = conn.execute(
+                """SELECT id, string_code, voc_v, isc_a, fill_factor, status, verdict, reason,
+                          created_by, created_at, processed_at
+                   FROM iv_scans ORDER BY id DESC"""
+            ).fetchall()
+            counts = {
+                "total": counts_row["total"],
+                "pass": counts_row["pass"],
+                "decay": counts_row["decay"],
+                "pending": counts_row["pending"],
+            }
+            snapshot = [dump(r) for r in scans]
+            body = render_book_body(
+                stamped_at, user["username"], counts, [dict(r) for r in scans]
+            )
+            book = conn.execute(
+                """INSERT INTO shift_handover_books
+                   (stamped_at, stamped_by, total_count, pass_count, decay_count,
+                    pending_count, body, snapshot)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                   RETURNING id, stamped_at, stamped_by, total_count, pass_count,
+                             decay_count, pending_count, body, snapshot""",
+                (
+                    stamped_at,
+                    user["username"],
+                    counts["total"],
+                    counts["pass"],
+                    counts["decay"],
+                    counts["pending"],
+                    body,
+                    Jsonb(snapshot),
+                ),
+            ).fetchone()
+        conn.commit()
+        return dump(book)
+
+
+app = Litestar(
+    route_handlers=[
+        health,
+        login,
+        list_logs,
+        create_log,
+        list_handover_books,
+        get_handover_book,
+        stamp_handover_book,
+    ]
+)

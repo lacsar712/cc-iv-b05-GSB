@@ -33,4 +33,15 @@ DROP TRIGGER IF EXISTS trg_iv_scan_notify ON iv_scans;
 CREATE TRIGGER trg_iv_scan_notify
 AFTER INSERT ON iv_scans
 FOR EACH ROW EXECUTE FUNCTION notify_iv_scan();
+CREATE TABLE IF NOT EXISTS shift_handover_books (
+    id serial PRIMARY KEY,
+    stamped_at timestamptz NOT NULL,
+    stamped_by text NOT NULL,
+    total_count integer NOT NULL,
+    pass_count integer NOT NULL,
+    decay_count integer NOT NULL,
+    pending_count integer NOT NULL,
+    body text NOT NULL,
+    snapshot jsonb NOT NULL
+);
 """
