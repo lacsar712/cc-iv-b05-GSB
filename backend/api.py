@@ -141,4 +141,40 @@ async def create_log(request: Request) -> dict:
         return dump(row)
 
 
-app = Litestar(route_handlers=[health, login, list_logs, create_log])
+@get("/api/handover-books")
+async def list_books(request: Request) -> list:
+    need_login(request)
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT id, total_count, pass_count, degraded_count, stamped_by, stamped_at
+               FROM handover_books ORDER BY id DESC"""
+        ).fetchall()
+        return [dump(r) for r in rows]
+
+
+@post("/api/handover-books", status_code=201)
+async def stamp_book(request: Request) -> dict:
+    user = need_login(request)
+    if user["role"] != "writer":
+        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="观察员只许翻已盖的本，不许盖章")
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        # 同一事务里取数并落库：计数定格在按下盖章这一瞬，之后单据再变也刮不掉本上的字
+        counts = conn.execute(
+            """SELECT COUNT(*) AS total,
+                      COUNT(*) FILTER (WHERE verdict = '合格') AS pass,
+                      COUNT(*) FILTER (WHERE verdict = '衰减') AS degraded
+               FROM iv_scans"""
+        ).fetchone()
+        row = conn.execute(
+            """INSERT INTO handover_books
+               (total_count, pass_count, degraded_count, stamped_by, stamped_at)
+               VALUES (%s,%s,%s,%s,%s)
+               RETURNING id, total_count, pass_count, degraded_count, stamped_by, stamped_at""",
+            (counts["total"], counts["pass"], counts["degraded"], user["username"], now),
+        ).fetchone()
+        conn.commit()
+        return dump(row)
+
+
+app = Litestar(route_handlers=[health, login, list_logs, create_log, list_books, stamp_book])

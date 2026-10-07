@@ -23,6 +23,14 @@ CREATE TABLE IF NOT EXISTS iv_scans (
     created_at timestamptz NOT NULL,
     processed_at timestamptz
 );
+CREATE TABLE IF NOT EXISTS handover_books (
+    id serial PRIMARY KEY,
+    total_count integer NOT NULL,
+    pass_count integer NOT NULL,
+    degraded_count integer NOT NULL,
+    stamped_by text NOT NULL,
+    stamped_at timestamptz NOT NULL
+);
 CREATE OR REPLACE FUNCTION notify_iv_scan() RETURNS trigger AS $$
 BEGIN
   PERFORM pg_notify('iv_scan_new', NEW.id::text);
